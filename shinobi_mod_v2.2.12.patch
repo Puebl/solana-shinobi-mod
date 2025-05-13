@@ -1,0 +1,359 @@
+diff --git a/agave/core/src/consensus.rs b/agave/core/src/consensus.rs
+index a1b2c3d..e4f5g6h 100644
+--- a/agave/core/src/consensus.rs
++++ b/agave/core/src/consensus.rs
+@@ -236,6 +236,12 @@ pub struct Tower {
+     stray_restored_slot: Option<Slot>,
+     pub last_switch_threshold_check: Option<(Slot, SwitchForkDecision)>,
++    #[serde(skip)]
++    mostly_confirmed_threshold: Option<f64>,
++    #[serde(skip)]
++    threshold_ahead_count: Option<u8>,
++    #[serde(skip)]
++    after_skip_threshold: Option<u8>,
++    #[serde(skip)]
++    threshold_escape_count: Option<u8>,
++    #[serde(skip)]
++    last_config_check_seconds: u64,
+ }
+ 
+ impl Default for Tower {
+@@ -251,6 +257,8 @@ impl Default for Tower {
+             stray_restored_slot: None,
+             last_switch_threshold_check: None,
+             last_vote_tx_blockhash: BlockhashStatus::default(),
++            mostly_confirmed_threshold: None,
++            threshold_ahead_count: None,
++            after_skip_threshold: None,
++            threshold_escape_count: None,
++            last_config_check_seconds: 0,
+         };
+         tower.initialize_lockouts();
+         tower
+@@ -632,14 +640,95 @@ impl Tower {
+     pub fn record_bank_vote(&mut self, bank: &Bank, vote_account: &Pubkey) -> Option<VoteTransaction> {
+         let vote_state_update = self.record_bank_vote_and_update_lockouts(bank);
+ 
++        // Check if configuration needs update (once per minute)
++        let current_time = time::SystemTime::now()
++            .duration_since(time::UNIX_EPOCH)
++            .unwrap_or_default()
++            .as_secs();
++        
++        if current_time - self.last_config_check_seconds >= 60 {
++            self.update_config();
++            self.last_config_check_seconds = current_time;
++        }
++        
++        // Проверим, нужно ли использовать shinobi-mod для оптимизации голосования
++        if self.is_mostly_confirmed_threshold_enabled() {
++
++            // Загрузим информацию о ставках для проверки mostly_confirmed
++            let vote_slot = bank.slot();
++            let mut voted_stakes = HashMap::new();
++            
++            // Необходимо заполнить voted_stakes из информации о голосах
++            let vote_accounts = bank.vote_accounts();
++            let mut total_stake: Stake = 1; // По умолчанию, чтобы избежать деления на ноль
++            
++            for (_, (stake, vote_account)) in vote_accounts.iter() {
++                total_stake += *stake;
++                let vote_state = VoteState::deserialize(&vote_account.data());
++                if let Ok(Some(vote_state)) = vote_state {
++                    self.populate_ancestor_voted_stakes(&mut voted_stakes, vote_state.votes.iter().map(|lockout| lockout.slot()), &HashSet::new());
++                }
++            }
++            
++            // Определяем, был ли пропущен слот
++            let last_voted_slot = self.last_voted_slot();
++            let was_skip_slot = last_voted_slot.map_or(false, |last| vote_slot > last + 1);
++            
++            // Определяем, сколько слотов прошло с момента последнего голоса
++            let slots_since_last_vote = last_voted_slot.map_or(vote_slot, |last| vote_slot - last);
++            
++            // Проверяем, следует ли голосовать за этот слот согласно правилам shinobi
++            if !self.should_vote_using_shinobi_rules(
++                vote_slot,
++                &voted_stakes,
++                total_stake,
++                was_skip_slot,
++                last_voted_slot,
++                slots_since_last_vote,
++            ) {
++                // Если не следует голосовать, пропускаем слот
++                info!("Skipping vote for slot {} according to shinobi rules", vote_slot);
++                return None;
++            }
++
++            // Если мы дошли до этого места, значит можно голосовать
++            // Сначала получим списки слотов для голосования и их предков
++            let mut ancestors = HashSet::new();
++            let mut votable_slots = HashSet::new();
++            let mut tower_slots = Vec::new();
++        
++            // Добавим предков текущего слота
++            let mut current_ancestors: Vec<_> = bank.ancestors().keys().cloned().collect();
++            ancestors.extend(current_ancestors.iter());
++            current_ancestors.sort();
++        
++            // Добавим слоты, которые мы уже голосовали
++            for vote in bank.vote_accounts().get(vote_account).unwrap().1.votes().iter() {
++                let slot = vote.slot();
++                tower_slots.push(slot);
++                votable_slots.insert(slot);
++            }
++        
++            // Слоты, которые мы уже голосовали ранее
++            self.vote_state.votes.iter().for_each(|lockout| {
++                tower_slots.push(lockout.slot());
++            });
++        
++            // Сортируем для правильного порядка
++            tower_slots.sort();
++            
++            // Backfill пропущенных слотов, если возможно
++            let target_slot = bank.slot();
++            let backfilled_slots = self.backfill_votes(target_slot, &ancestors, &tower_slots, &votable_slots);
++        
++            if !backfilled_slots.is_empty() {
++                info!("Backfilled votes for slots: {:?}", backfilled_slots);
++        
++                // Добавляем backfilled слоты в список для голосования
++                let mut slots_to_vote = backfilled_slots;
++                slots_to_vote.push(target_slot);
++        
++                // Создаем VoteStateUpdate с backfilled слотами
++                let vote_state_update = VoteStateUpdate {
++                    root: None,
++                    hash: bank.hash(),
++                    slots: slots_to_vote,
++                    timestamp: self.maybe_timestamp(bank.clone()),
++                };
++        
++                // Обновляем lockouts с полным списком слотов, включая backfilled
++                self.record_vote(bank.slot(), vote_state_update.hash, false);
++                return Some(VoteTransaction::from(vote_state_update));
++            }
++        }
++        
+         vote_state_update.map(VoteTransaction::from)
+     }
+ 
+@@ -688,6 +777,11 @@ impl Tower {
+     ) -> Option<VoteStateUpdate> {
+         // Try to get the bank's vote state.
+         trace!("Attempting to update lockouts for slot {}", bank.slot());
++        
++        // If using shinobi-mod, we'll handle backfilling in record_bank_vote
++        if self.is_mostly_confirmed_threshold_enabled() {
++            return self.normal_vote_state_update(bank, slot_hash_status);
++        }
+ 
+         let mut vote_state_update = self.normal_vote_state_update(bank, slot_hash_status)?;
+ 
+@@ -755,6 +849,76 @@ impl Tower {
+         cache
+     }
+ 
++    // Проверяет, включен ли режим mostly_confirmed_threshold
++    pub fn is_mostly_confirmed_threshold_enabled(&self) -> bool {
++        self.mostly_confirmed_threshold.is_some()
++    }
++    
++    // Обновляет параметры из конфигурационного файла
++    pub fn update_config(&mut self) {
++        // Читаем файл конфигурации
++        if let Ok(config_str) = fs::read_to_string("mostly_confirmed_threshold") {
++            let parts: Vec<&str> = config_str.trim().split_whitespace().collect();
++            if parts.len() >= 1 {
++                if let Ok(threshold) = parts[0].parse::<f64>() {
++                    self.mostly_confirmed_threshold = Some(threshold);
++                    info!("Updated mostly_confirmed_threshold to {}", threshold);
++                }
++            }
++            if parts.len() >= 2 {
++                if let Ok(ahead_count) = parts[1].parse::<u8>() {
++                    self.threshold_ahead_count = Some(ahead_count);
++                    info!("Updated threshold_ahead_count to {}", ahead_count);
++                }
++            }
++            if parts.len() >= 3 {
++                if let Ok(skip_threshold) = parts[2].parse::<u8>() {
++                    self.after_skip_threshold = Some(skip_threshold);
++                    info!("Updated after_skip_threshold to {}", skip_threshold);
++                }
++            }
++            if parts.len() >= 4 {
++                if let Ok(escape_count) = parts[3].parse::<u8>() {
++                    self.threshold_escape_count = Some(escape_count);
++                    info!("Updated threshold_escape_count to {}", escape_count);
++                }
++            }
++        } else {
++            // Если файл не существует, отключаем функциональность
++            self.mostly_confirmed_threshold = None;
++        }
++    }
++    
++    // Проверяет, является ли слот mostly_confirmed
++    pub fn is_slot_mostly_confirmed(
++        &self,
++        slot: Slot,
++        voted_stakes: &VotedStakes,
++        total_stake: Stake,
++    ) -> bool {
++        let mostly_confirmed_threshold = if let Some(m) = self.mostly_confirmed_threshold {
++            m
++        } else {
++            SWITCH_FORK_THRESHOLD
++        };
++
++        voted_stakes
++            .get(&slot)
++            .map(|stake| (*stake as f64 / total_stake as f64) > mostly_confirmed_threshold)
++            .unwrap_or(false)
++    }
++    
++    // Проверяет, следует ли голосовать за слот согласно правилам shinobi-mod
++    pub fn should_vote_using_shinobi_rules(
++        &self,
++        slot: Slot,                 // Слот для проверки
++        voted_stakes: &VotedStakes, // Карта ставок по слотам
++        total_stake: Stake,        // Общая ставка
++        was_skip_slot: bool,        // Был ли пропущен слот
++        last_voted_slot: Option<Slot>, // Последний проголосованный слот
++        slots_since_last_vote: u64 // Количество слотов с момента последнего голоса
++    ) -> bool {
++        // Если режим shinobi не включен, всегда голосуем
++        if !self.is_mostly_confirmed_threshold_enabled() {
++            return true;
++        }
++        
++        // Проверим escape_hatch - если мы не голосовали слишком долго, голосуем в любом случае
++        if let Some(escape_count) = self.threshold_escape_count {
++            if slots_since_last_vote >= escape_count as u64 {
++                warn!("Using escape hatch for slot: {} after {} slots without voting", slot, slots_since_last_vote);
++                return true;
++            }
++        }
++        
++        // Найдём последний mostly_confirmed слот
++        let mut last_mostly_confirmed_slot = 0;
++        if let Some(last_voted) = last_voted_slot {
++            for check_slot in (0..=last_voted).rev() {
++                if self.is_slot_mostly_confirmed(check_slot, voted_stakes, total_stake) {
++                    last_mostly_confirmed_slot = check_slot;
++                    break;
++                }
++            }
++        }
++        
++        // Проверяем, является ли текущий слот mostly_confirmed
++        let is_current_mostly_confirmed = self.is_slot_mostly_confirmed(slot, voted_stakes, total_stake);
++        
++        // Проверяем правила для слотов после пропуска
++        if was_skip_slot && self.after_skip_threshold.is_some() {
++            let after_skip_rule = self.after_skip_threshold.unwrap();
++            
++            // Режим 1: После пропуска требуется mostly_confirmed_threshold
++            if after_skip_rule == 1 {
++                return is_current_mostly_confirmed;
++            }
++            // Режим 2: После пропуска требуется полный консенсус
++            else if after_skip_rule == 2 {
++                return self.is_slot_confirmed(slot, voted_stakes, total_stake);
++            }
++        }
++        
++        // Проверяем основное правило: голосуем за mostly_confirmed слоты
++        // или слоты в пределах threshold_ahead_count от последнего mostly_confirmed
++        if is_current_mostly_confirmed {
++            return true;
++        } else if let Some(ahead_count) = self.threshold_ahead_count {
++            // Можем голосовать за ahead_count слотов вперед от последнего mostly_confirmed
++            return slot <= last_mostly_confirmed_slot + ahead_count as u64;
++        }
++        
++        false
++    }
++
+     pub fn last_vote(&self) -> VoteTransaction {
+         self.last_vote.clone()
+     }
+@@ -1462,6 +1626,57 @@ impl Tower {
+         voted_stakes
+     }
+ 
++    // Backfill пропущенных слотов для улучшения количества кредитов
++    pub fn backfill_votes(
++        &self,
++        vote_slot: Slot,
++        ancestors: &HashSet<Slot>,
++        tower_slots: &[Slot],
++        votable_slots: &HashSet<Slot>,
++    ) -> Vec<Slot> {
++        // Если режим shinobi не включен, не делаем backfill
++        if !self.is_mostly_confirmed_threshold_enabled() {
++            return vec![];
++        }
++
++        // Получаем последний проголосованный слот
++        let last_voted_slot = tower_slots.last().copied().unwrap_or(0);
++
++        // Если нет пропуска или текущий слот равен последнему + 1, backfill не нужен
++        if vote_slot == 0 || vote_slot <= last_voted_slot || vote_slot == last_voted_slot + 1 {
++            return vec![];
++        }
++
++        // Создаем вектор для добавления промежуточных слотов
++        let mut backfill_slots = Vec::new();
++
++        // Перебираем все слоты между последним проголосованным и текущим
++        for slot in (last_voted_slot + 1)..vote_slot {
++            // Проверяем, что слот является предком текущего и подходит для голосования
++            if ancestors.contains(&slot) && votable_slots.contains(&slot) {
++                // Проверяем, что слот не заблокирован другими голосами
++                if !self.is_locked_out_including(slot, vote_slot) {
++                    backfill_slots.push(slot);
++                }
++            }
++        }
++
++        // Удаляем слоты, которые могли бы создать слишком длинную блокировку (более 64 слотов)
++        if !backfill_slots.is_empty() {
++            self.pop_votes_locked_out_at(vote_slot, &mut backfill_slots);
++        }
++
++        backfill_slots
++    }
++
++    // Проверяет, заблокирован ли слот, включая предоставленный слот
++    fn is_locked_out_including(&self, slot: Slot, including_slot: Slot) -> bool {
++        let vote_state = self.vote_state.clone();
++        let slot_epoch = self.epoch_schedule.get_epoch(slot);
++
++        for lockout in &vote_state.votes {
++            if lockout.slot() == including_slot {
++                continue;
++            }
++            if slot <= lockout.slot() + lockout.confirmation_count() as u64
++                && lockout.slot() <= slot + lockout.confirmation_count() as u64
++                && slot_epoch > self.epoch_schedule.get_epoch(lockout.slot())
++            {
++                return true;
++            }
++        }
++        false
++    }
++
++    // Удаляет голоса, которые могли бы создать слишком длинную блокировку
++    fn pop_votes_locked_out_at(&self, slot: Slot, votes: &mut Vec<Slot>) {
++        votes.retain(|&vote_slot| {
++            // Если разница между слотами достаточно большая, может быть слишком длинная блокировка
++            slot.saturating_sub(vote_slot) < 64
++        });
++    }
++    
+     /// Return the total stake of all vote accounts in the bank
+     fn bank_total_stake(&self, bank: &Bank) -> u64 {
+         bank.vote_accounts()
